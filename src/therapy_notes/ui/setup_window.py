@@ -111,6 +111,11 @@ class _SpacySignals(QObject):
     error = pyqtSignal(str)
 
 
+class _UpdateSignals(QObject):
+    ok    = pyqtSignal(str)   # summary of what changed
+    error = pyqtSignal(str)
+
+
 
 # ── Setup window ──────────────────────────────────────────────────────────────
 
@@ -337,6 +342,22 @@ class SetupWindow(QDialog):
         note.setStyleSheet("color: gray; font-size: 12px;")
         zoom_l.addWidget(note)
         self._main.addWidget(zoom)
+
+        # ── Update App ────────────────────────────────────────────────────────
+        self._update = self._step(
+            "Update App",
+            "Pull the latest changes from GitHub and reinstall dependencies.",
+            btn="Check for Updates",
+            status_char="↑",
+        )
+        self._update.btn.clicked.connect(self._run_update)
+
+        self._update_progress = QProgressBar()
+        self._update_progress.setRange(0, 0)
+        self._update_progress.setFixedHeight(4)
+        self._update_progress.setTextVisible(False)
+        self._update_progress.setVisible(False)
+        self._update.col.addWidget(self._update_progress)
 
         self._main.addStretch()
 
@@ -727,6 +748,31 @@ class SetupWindow(QDialog):
         self._lb.btn.setText("Run Test")
         _apply_result(self._lb, transcript, ratio)
 
+    # ── Update App ────────────────────────────────────────────────────────────
+
+    def _run_update(self) -> None:
+        self._update.btn.setEnabled(False)
+        self._update.btn.setText("Updating…")
+        self._update.set_info("Running git pull…")
+        self._update_progress.setVisible(True)
+
+        sigs = _UpdateSignals()
+        sigs.ok.connect(self._on_update_ok)
+        sigs.error.connect(self._on_update_error)
+        threading.Thread(target=_do_update, args=(sigs,), daemon=True).start()
+
+    def _on_update_ok(self, msg: str) -> None:
+        self._update_progress.setVisible(False)
+        self._update.btn.setEnabled(True)
+        self._update.btn.setText("Check for Updates")
+        self._update.set_ok(msg)
+
+    def _on_update_error(self, msg: str) -> None:
+        self._update_progress.setVisible(False)
+        self._update.btn.setEnabled(True)
+        self._update.btn.setText("Check for Updates")
+        self._update.set_fail(msg)
+
     # ── Shared error handler ──────────────────────────────────────────────────
 
     def _on_test_error(self, step: _Step, msg: str) -> None:
@@ -837,6 +883,39 @@ def _run_ollama_test(base_url: str, model: str, signals: _OllamaSignals) -> None
         )
         reply = response.choices[0].message.content.strip()
         signals.ok.emit(reply)
+    except Exception as exc:
+        signals.error.emit(str(exc))
+
+
+def _do_update(signals: _UpdateSignals) -> None:
+    try:
+        repo_root = Path(__file__).parents[4]
+
+        pull = subprocess.run(
+            ["git", "pull"],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+        )
+        if pull.returncode != 0:
+            signals.error.emit(pull.stderr.strip() or pull.stdout.strip())
+            return
+
+        already_up_to_date = "Already up to date." in pull.stdout
+
+        if not already_up_to_date:
+            sync = subprocess.run(
+                ["uv", "sync"],
+                capture_output=True,
+                text=True,
+                cwd=repo_root,
+            )
+            if sync.returncode != 0:
+                signals.error.emit(sync.stderr.strip() or sync.stdout.strip())
+                return
+            signals.ok.emit("Updated successfully — please restart the app.")
+        else:
+            signals.ok.emit("Already up to date.")
     except Exception as exc:
         signals.error.emit(str(exc))
 
