@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "therapy-notes"
+version = "0.1.0"
+description = "Local therapy session recorder and AI-assisted note generator"
+requires-python = ">=3.11"
+dependencies = [
+    # Audio recording
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0,<2",
+    "scipy>=1.10.0",
+    # Local transcription (runs fully offline)
+    "faster-whisper>=1.1.0",
+    # AI note generation
+    "anthropic>=0.30.0",
+    "openai>=1.40.0",
+    # PII anonymization (runs fully offline)
+    "presidio-analyzer>=2.2.33",
+    "presidio-anonymizer>=2.2.33",
+    "spacy>=3.7.0",
+    # Config & UI
+    "python-dotenv>=1.0.0",
+    "PyQt6>=6.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.14",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/therapy_notes"]
+
+[project.scripts]
+therapy-notes = "therapy_notes.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: loads Whisper or does heavy processing",
+]

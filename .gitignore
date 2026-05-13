@@ -1,0 +1,27 @@
+# ── Environment & secrets ─────────────────────────────────────────────────────
+.env
+
+# ── Sessions — contain PHI, never commit ──────────────────────────────────────
+sessions/
+!sessions/.gitkeep
+
+# ── Python / UV ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+# uv.lock is intentionally NOT ignored — commit it to pin exact versions
+
+# ── Whisper model cache ────────────────────────────────────────────────────────
+models/
+~/.cache/huggingface/
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+.claude/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
