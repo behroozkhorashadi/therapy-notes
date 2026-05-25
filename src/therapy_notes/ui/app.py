@@ -71,6 +71,7 @@ class TherapyNotesApp(QWidget):
         self._total_seconds = config.session_duration_minutes * 60
         self._elapsed = 0
         self._running = False
+        self._processing_count = 0
 
         self._tick_timer = QTimer()
         self._tick_timer.setInterval(1000)
@@ -165,7 +166,7 @@ class TherapyNotesApp(QWidget):
         self._btn.setText("Stop Meeting")
         self._btn.setStyleSheet(_BTN_STOP)
         self._couples_cb.setEnabled(False)
-        self._status_lbl.setText("Recording...")
+        self._status_lbl.setText(self._recording_status())
         self._status_lbl.setStyleSheet("color: white; font-size: 12px;")
         self._tick_timer.start()
 
@@ -173,9 +174,16 @@ class TherapyNotesApp(QWidget):
         self._running = False
         self._tick_timer.stop()
         recording = self._recorder.stop()
-        self._btn.setEnabled(False)
-        self._btn.setText("Processing...")
+
+        # Reset UI immediately so the next session can start right away.
+        self._processing_count += 1
+        self._btn.setText("Start Meeting")
+        self._btn.setStyleSheet(_BTN_START)
+        self._couples_cb.setEnabled(True)
+        self._timer_lbl.setText(self._fmt(0))
         self._progress.setVisible(True)
+        self._status_lbl.setText("Processing in background...")
+        self._status_lbl.setStyleSheet("color: gray; font-size: 12px;")
 
         couples = self._couples_cb.isChecked()
         signals = _Signals()
@@ -240,28 +248,31 @@ class TherapyNotesApp(QWidget):
     # ── Slot handlers (main thread) ───────────────────────────────────────────
 
     def _on_status(self, text: str) -> None:
-        self._status_lbl.setText(text)
+        # Don't let background pipeline messages clobber the active recording state.
+        if not self._running:
+            self._status_lbl.setText(text)
 
     def _on_done(self, notes: str, notes_path_str: str) -> None:
         notes_path = Path(notes_path_str)
-        self._progress.setVisible(False)
-        self._btn.setEnabled(True)
-        self._btn.setText("Start Meeting")
-        self._btn.setStyleSheet(_BTN_START)
-        self._couples_cb.setEnabled(True)
-        self._timer_lbl.setText(self._fmt(0))
-        self._status_lbl.setText(f"Done — saved to {notes_path.parent.name}/")
-        self._status_lbl.setStyleSheet("color: gray; font-size: 12px;")
+        self._processing_count -= 1
+        self._progress.setVisible(self._processing_count > 0)
+        if self._running:
+            self._status_lbl.setText(self._recording_status())
+        elif self._processing_count == 0:
+            self._status_lbl.setText(f"Done — saved to {notes_path.parent.name}/")
+            self._status_lbl.setStyleSheet("color: gray; font-size: 12px;")
+        else:
+            self._status_lbl.setText(f"Still processing {self._processing_count} session(s)...")
         self._open_notes_viewer(notes, notes_path)
 
     def _on_error(self, message: str) -> None:
-        self._progress.setVisible(False)
-        self._btn.setEnabled(True)
-        self._btn.setText("Start Meeting")
-        self._btn.setStyleSheet(_BTN_START)
-        self._couples_cb.setEnabled(True)
-        self._status_lbl.setText(f"Error: {message}")
-        self._status_lbl.setStyleSheet("color: #e74c3c; font-size: 12px;")
+        self._processing_count -= 1
+        self._progress.setVisible(self._processing_count > 0)
+        if self._running:
+            self._status_lbl.setText(self._recording_status())
+        else:
+            self._status_lbl.setText(f"Error: {message}")
+            self._status_lbl.setStyleSheet("color: #e74c3c; font-size: 12px;")
         print(f"[error] {message}")
 
     # ── Notes viewer ──────────────────────────────────────────────────────────
@@ -295,7 +306,12 @@ class TherapyNotesApp(QWidget):
         layout.addLayout(buttons)
         dialog.show()
 
-    # ── Helper ────────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _recording_status(self) -> str:
+        if self._processing_count > 0:
+            return f"Recording... ({self._processing_count} processing)"
+        return "Recording..."
 
     def _fmt(self, elapsed: int) -> str:
         em, es = divmod(elapsed, 60)
