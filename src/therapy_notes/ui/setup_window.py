@@ -889,7 +889,7 @@ def _run_ollama_test(base_url: str, model: str, signals: _OllamaSignals) -> None
 
 def _do_update(signals: _UpdateSignals) -> None:
     try:
-        repo_root = Path(__file__).parents[4]
+        repo_root = Path(__file__).parents[3]
 
         pull = subprocess.run(
             ["git", "pull"],
