@@ -83,22 +83,25 @@ def _build_system_prompt(couples: bool, anonymized: bool) -> str:
     return header + body
 
 
+# Default system prompt (individual session, anonymized transcript).
+# Exposed as a module constant so tests can make assertions against it.
+_SYSTEM_PROMPT = _build_system_prompt(couples=False, anonymized=True)
+
+
 class NoteGenerator:
     def __init__(self, couples: bool = False, anonymized: bool = True) -> None:
-        if couples:
-            if not config.couples_template_file.exists():
-                raise FileNotFoundError(f"Couples template not found: {config.couples_template_file}")
-            self._template = config.couples_template_file.read_text()
-        else:
-            if not config.template_file.exists():
-                raise FileNotFoundError(f"Note template not found: {config.template_file}")
-            self._template = config.template_file.read_text()
+        template_path = config.couples_template_file if couples else config.template_file
+        if not template_path.exists():
+            raise FileNotFoundError(f"Template not found: {template_path}")
+        self._template = template_path.read_text()
+        self._anonymized = anonymized
         self._system_prompt = _build_system_prompt(couples=couples, anonymized=anonymized)
 
-    def generate(self, anonymized_transcript: str) -> str:
+    def generate(self, transcript: str) -> str:
+        label = "Anonymized session transcript" if self._anonymized else "Session transcript"
         prompt = (
-            "Anonymized session transcript:\n\n"
-            f"<transcript>\n{anonymized_transcript}\n</transcript>\n\n"
+            f"{label}:\n\n"
+            f"<transcript>\n{transcript}\n</transcript>\n\n"
             "Please complete the following SOAP note template based on this session:\n\n"
             f"<template>\n{self._template}\n</template>"
         )
@@ -118,10 +121,18 @@ class NoteGenerator:
         )
         return message.content[0].text
 
-    def _call_openai(self, prompt: str) -> str:
-        client = openai.OpenAI(api_key=config.openai_api_key)
+    def _call_openai_compatible(
+        self,
+        prompt: str,
+        *,
+        api_key: str,
+        model: str,
+        base_url: str | None = None,
+    ) -> str:
+        """Shared implementation for OpenAI-protocol providers (OpenAI and Ollama)."""
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
         response = client.chat.completions.create(
-            model=config.ai_model_openai,
+            model=model,
             messages=[
                 {"role": "system", "content": self._system_prompt},
                 {"role": "user", "content": prompt},
@@ -130,17 +141,17 @@ class NoteGenerator:
         )
         return response.choices[0].message.content
 
+    def _call_openai(self, prompt: str) -> str:
+        return self._call_openai_compatible(
+            prompt,
+            api_key=config.openai_api_key,
+            model=config.ai_model_openai,
+        )
+
     def _call_ollama(self, prompt: str) -> str:
-        client = openai.OpenAI(
-            base_url=f"{config.ollama_base_url}/v1",
+        return self._call_openai_compatible(
+            prompt,
             api_key="ollama",  # required by SDK, not used by Ollama
-        )
-        response = client.chat.completions.create(
             model=config.ollama_model,
-            messages=[
-                {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=2048,
+            base_url=f"{config.ollama_base_url}/v1",
         )
-        return response.choices[0].message.content

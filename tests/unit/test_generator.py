@@ -115,3 +115,110 @@ class TestProviderRouting:
             mock.assert_called_once()
         finally:
             patcher.stop()
+
+
+class TestMissingTemplate:
+    """NoteGenerator raises FileNotFoundError when a template path doesn't exist."""
+
+    def test_missing_individual_template(self, monkeypatch):
+        monkeypatch.setenv("TEMPLATE_FILE", "/nonexistent/template.txt")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        from therapy_notes.config import Config
+        cfg = Config()
+        with patch("therapy_notes.notes.generator.config", cfg):
+            with pytest.raises(FileNotFoundError, match="Template not found"):
+                NoteGenerator(couples=False)
+
+    def test_missing_couples_template(self, tmp_path, monkeypatch):
+        # Individual template exists but couples template does not
+        individual = tmp_path / "template.txt"
+        individual.write_text("TEMPLATE")
+        monkeypatch.setenv("TEMPLATE_FILE", str(individual))
+        monkeypatch.setenv("COUPLES_TEMPLATE_FILE", "/nonexistent/couples.txt")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        from therapy_notes.config import Config
+        cfg = Config()
+        with patch("therapy_notes.notes.generator.config", cfg):
+            with pytest.raises(FileNotFoundError, match="Template not found"):
+                NoteGenerator(couples=True)
+
+
+class TestAnonymizedFlag:
+    """The prompt label changes based on the anonymized flag."""
+
+    @pytest.fixture
+    def make_gen(self, tmp_path, monkeypatch):
+        template = tmp_path / "template.txt"
+        template.write_text("S:\nO:\nA:\nP:")
+        monkeypatch.setenv("TEMPLATE_FILE", str(template))
+        monkeypatch.setenv("AI_PROVIDER", "anthropic")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        from therapy_notes.config import Config
+        cfg = Config()
+
+        def _factory(anonymized: bool):
+            with patch("therapy_notes.notes.generator.config", cfg):
+                return NoteGenerator(anonymized=anonymized), cfg
+        return _factory
+
+    def test_anonymized_prompt_label(self, make_gen):
+        gen, cfg = make_gen(anonymized=True)
+        with patch("therapy_notes.notes.generator.config", cfg):
+            with patch.object(gen, "_call_anthropic", return_value="notes") as mock:
+                gen.generate("transcript")
+        prompt = mock.call_args[0][0]
+        assert prompt.startswith("Anonymized session transcript")
+
+    def test_not_anonymized_prompt_label(self, make_gen):
+        gen, cfg = make_gen(anonymized=False)
+        with patch("therapy_notes.notes.generator.config", cfg):
+            with patch.object(gen, "_call_anthropic", return_value="notes") as mock:
+                gen.generate("transcript")
+        prompt = mock.call_args[0][0]
+        assert prompt.startswith("Session transcript")
+        assert not prompt.startswith("Anonymized")
+
+
+class TestCouplesMode:
+    """NoteGenerator with couples=True uses the couples template and prompt."""
+
+    @pytest.fixture
+    def couples_gen(self, tmp_path, monkeypatch):
+        individual = tmp_path / "template.txt"
+        individual.write_text("INDIVIDUAL TEMPLATE")
+        couples = tmp_path / "couples_template.txt"
+        couples.write_text("COUPLES TEMPLATE")
+        monkeypatch.setenv("TEMPLATE_FILE", str(individual))
+        monkeypatch.setenv("COUPLES_TEMPLATE_FILE", str(couples))
+        monkeypatch.setenv("AI_PROVIDER", "anthropic")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        from therapy_notes.config import Config
+        cfg = Config()
+        with patch("therapy_notes.notes.generator.config", cfg):
+            gen = NoteGenerator(couples=True)
+            yield gen, cfg
+
+    def test_couples_template_in_prompt(self, couples_gen):
+        gen, cfg = couples_gen
+        with patch("therapy_notes.notes.generator.config", cfg):
+            with patch.object(gen, "_call_anthropic", return_value="notes") as mock:
+                gen.generate("transcript")
+        prompt = mock.call_args[0][0]
+        assert "COUPLES TEMPLATE" in prompt
+        assert "INDIVIDUAL TEMPLATE" not in prompt
+
+    def test_couples_system_prompt_content(self):
+        from therapy_notes.notes.generator import _build_system_prompt
+        prompt = _build_system_prompt(couples=True, anonymized=True)
+        assert "couples" in prompt.lower()
+        # Couples body explains the shared Client: channel
+        assert "Partner" in prompt
+
+    def test_individual_system_prompt_content(self):
+        from therapy_notes.notes.generator import _build_system_prompt
+        prompt = _build_system_prompt(couples=False, anonymized=True)
+        assert "SOAP" in prompt
+        assert "Subjective" in prompt
+        assert "Objective" in prompt
+        # Individual prompt should NOT mention couples-specific partner logic
+        assert "Partner 1" not in prompt

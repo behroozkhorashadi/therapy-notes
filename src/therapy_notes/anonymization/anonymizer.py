@@ -12,7 +12,6 @@ AI note generator understands context without seeing real names or dates.
 """
 
 import re
-from typing import Optional
 
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
@@ -55,13 +54,14 @@ _SPEAKER_RE = re.compile(r"((?:Therapist|Client): )")
 
 class Anonymizer:
     def __init__(self) -> None:
-        self._analyzer: Optional[AnalyzerEngine] = None
-        self._anonymizer: Optional[AnonymizerEngine] = None
+        # Engines are initialized lazily on first use (each ~1–2 s to load).
+        self._engines: tuple[AnalyzerEngine, AnonymizerEngine] | None = None
 
-    def _load(self) -> None:
-        if self._analyzer is None:
-            self._analyzer = AnalyzerEngine()
-            self._anonymizer = AnonymizerEngine()
+    def _load(self) -> tuple[AnalyzerEngine, AnonymizerEngine]:
+        """Lazy-initialize Presidio engines and return them."""
+        if self._engines is None:
+            self._engines = (AnalyzerEngine(), AnonymizerEngine())
+        return self._engines
 
     def anonymize(self, text: str) -> str:
         """Remove PII from text and return the redacted version.
@@ -69,7 +69,6 @@ class Anonymizer:
         Speaker labels ("Therapist: " / "Client: ") are preserved by
         anonymizing each speaker turn separately.
         """
-        self._load()
         parts = _SPEAKER_RE.split(text)
         if len(parts) == 1:
             # No speaker labels — flat transcript, anonymize whole text
@@ -81,13 +80,14 @@ class Anonymizer:
         return "".join(parts)
 
     def _anonymize_chunk(self, text: str) -> str:
-        results = self._analyzer.analyze(
+        analyzer, anonymizer = self._load()
+        results = analyzer.analyze(
             text=text,
             language="en",
             entities=_ENTITIES,
             score_threshold=0.4,
         )
-        result = self._anonymizer.anonymize(
+        result = anonymizer.anonymize(
             text=text,
             analyzer_results=results,
             operators=_OPERATORS,
