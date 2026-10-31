@@ -1,16 +1,53 @@
 from __future__ import annotations
 
 """
-Sends the anonymized transcript + SOAP template to an AI API and returns
-completed session notes. This is the only step that touches the internet.
+Sends the transcript + SOAP template to the chosen AI provider and returns
+completed session notes. Cloud providers receive the PII-scrubbed transcript;
+Ollama runs on this machine and receives the raw one.
+
+Any incomplete result raises NoteGenerationError. A cut-off or refused note must
+never be saved as if it were complete.
 """
+
+import json
+import logging
+import urllib.error
+import urllib.request
 
 import anthropic
 import openai
 
 from ..config import config
 
-# Ollama exposes an OpenAI-compatible endpoint — no extra dependency needed.
+
+log = logging.getLogger(__name__)
+
+
+class NoteGenerationError(RuntimeError):
+    pass
+
+
+# Enough for a long session's note, with streaming so long replies can't time out.
+_MAX_TOKENS = 16_000
+
+# These models accept effort and server-side refusal fallback.
+_FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
+
+_RISK_INDIVIDUAL = """\
+- Risk assessment fields (suicidal/homicidal ideation, risk level) may only be \
+  completed from what was actually said. Mark "Denied" only if the client \
+  explicitly denied it in the transcript. If it was not discussed, leave the \
+  boxes unchecked and write "Not assessed in this recording — clinician to \
+  complete." Never infer a denial or a risk level from silence.
+"""
+
+_RISK_COUPLES = """\
+- Risk assessment fields must be handled separately for each partner, and only \
+  from what was actually said. Mark "Denied" only if that partner explicitly \
+  denied it in the transcript. If it was not discussed, leave the boxes \
+  unchecked and write "Not assessed in this recording — clinician to complete." \
+  Never infer a denial or a risk level from silence.
+"""
 
 _PII_ANONYMIZED = (
     "You will receive an anonymized transcript of a telehealth {session_type} session. "
@@ -40,10 +77,7 @@ appears in the transcript. Follow these rules:
 - Use "[unclear from recording]" when the transcript is garbled or ambiguous.
 - Preserve the template's structure and formatting exactly — only fill in \
   the blank areas.
-- Risk assessment fields (suicidal/homicidal ideation) must always be \
-  completed. If not mentioned in the session, write \
-  "Denied — not reported in session."
-"""
+""" + _RISK_INDIVIDUAL
 
 _COUPLES_BODY = """\
 
@@ -66,9 +100,7 @@ on what appears in the transcript. Follow these rules:
 - Use "[unclear from recording]" when the transcript is garbled or ambiguous.
 - Preserve the template's structure and formatting exactly — only fill in \
   the blank areas.
-- Risk assessment fields must be completed for each partner. If not mentioned \
-  in the session, write "Denied — not reported in session."
-"""
+""" + _RISK_COUPLES
 
 
 def _build_system_prompt(couples: bool, anonymized: bool) -> str:
@@ -93,7 +125,7 @@ class NoteGenerator:
         template_path = config.couples_template_file if couples else config.template_file
         if not template_path.exists():
             raise FileNotFoundError(f"Template not found: {template_path}")
-        self._template = template_path.read_text()
+        self._template = template_path.read_text(encoding="utf-8")
         self._anonymized = anonymized
         self._system_prompt = _build_system_prompt(couples=couples, anonymized=anonymized)
 
@@ -113,45 +145,99 @@ class NoteGenerator:
 
     def _call_anthropic(self, prompt: str) -> str:
         client = anthropic.Anthropic(api_key=config.anthropic_api_key)
-        message = client.messages.create(
-            model=config.ai_model_anthropic,
-            max_tokens=2048,
-            system=self._system_prompt,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return message.content[0].text
+        model = config.ai_model_anthropic
+        request: dict = {
+            "model": model,
+            "max_tokens": _MAX_TOKENS,
+            "system": self._system_prompt,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        message = None
+        if model in _FALLBACK_MODELS:
+            # Clinical content can trip safety classifiers; fall back, not fail.
+            try:
+                with client.beta.messages.stream(
+                    **request,
+                    output_config={"effort": "high"},
+                    betas=["server-side-fallback-2026-07-01"],
+                    extra_body={"fallbacks": "default"},
+                ) as stream:
+                    message = stream.get_final_message()
+            except anthropic.BadRequestError as exc:
+                # An optional feature being rejected must not stop the note.
+                log.warning("Fallback request rejected (%s); retrying without it", exc.status_code)
+        if message is None:
+            with client.messages.stream(**request) as stream:
+                message = stream.get_final_message()
+        if message.stop_reason == "refusal":
+            raise NoteGenerationError("The AI provider declined to write this note. Write it manually or retry.")
+        if message.stop_reason == "max_tokens":
+            raise NoteGenerationError("The note was cut off before it finished. Retry the session.")
+        text = "".join(block.text for block in message.content if block.type == "text").strip()
+        if not text:
+            raise NoteGenerationError("The AI provider returned an empty note.")
+        return text
 
-    def _call_openai_compatible(
-        self,
-        prompt: str,
-        *,
-        api_key: str,
-        model: str,
-        base_url: str | None = None,
-    ) -> str:
-        """Shared implementation for OpenAI-protocol providers (OpenAI and Ollama)."""
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+    def _call_openai(self, prompt: str) -> str:
+        client = openai.OpenAI(api_key=config.openai_api_key)
         response = client.chat.completions.create(
-            model=model,
+            model=config.ai_model_openai,
             messages=[
                 {"role": "system", "content": self._system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=2048,
+            max_completion_tokens=_MAX_TOKENS,
         )
-        return response.choices[0].message.content
-
-    def _call_openai(self, prompt: str) -> str:
-        return self._call_openai_compatible(
-            prompt,
-            api_key=config.openai_api_key,
-            model=config.ai_model_openai,
-        )
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise NoteGenerationError("The note was cut off before it finished. Retry the session.")
+        text = (choice.message.content or "").strip()
+        if not text:
+            raise NoteGenerationError("The AI provider returned an empty note.")
+        return text
 
     def _call_ollama(self, prompt: str) -> str:
-        return self._call_openai_compatible(
-            prompt,
-            api_key="ollama",  # required by SDK, not used by Ollama
-            model=config.ollama_model,
-            base_url=f"{config.ollama_base_url}/v1",
+        """Use Ollama's native API, the way to set the context window per request.
+
+        Ollama's default window is smaller than a long session's transcript, and it
+        silently drops what doesn't fit, so size the window to the prompt and verify.
+        """
+        total_chars = len(self._system_prompt) + len(prompt)
+        estimated_tokens = total_chars // 3
+        body = {
+            "model": config.ollama_model,
+            "stream": False,
+            "keep_alive": "2m",
+            "messages": [
+                {"role": "system", "content": self._system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "options": {
+                "num_ctx": min(max(8192, estimated_tokens + 6000), 65536),
+                "num_predict": 6000,
+            },
+        }
+        request = urllib.request.Request(
+            f"{config.ollama_base_url}/api/chat",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
         )
+        try:
+            with urllib.request.urlopen(request, timeout=1800) as response:
+                reply = json.load(response)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+            raise NoteGenerationError(f"Ollama error: {detail}") from exc
+        except OSError as exc:
+            raise NoteGenerationError(f"Could not reach Ollama at {config.ollama_base_url}: {exc}") from exc
+
+        if reply.get("done_reason") == "length":
+            raise NoteGenerationError("The note was cut off before it finished. Retry the session.")
+        evaluated = reply.get("prompt_eval_count") or 0
+        # Text averages about 4 characters per token; well under that means truncation.
+        if evaluated and evaluated < total_chars / 8:
+            raise NoteGenerationError("The transcript didn't fit in the local model's memory, so no note was saved.")
+        text = (reply.get("message", {}).get("content") or "").strip()
+        if not text:
+            raise NoteGenerationError("The local model returned an empty note.")
+        return text

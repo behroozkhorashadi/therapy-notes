@@ -51,6 +51,11 @@ _OPERATORS: dict[str, OperatorConfig] = {
 
 _SPEAKER_RE = re.compile(r"((?:Therapist|Client): )")
 
+# Calendar dates identify; relative phrases like "last week" don't, and notes need them.
+_SPECIFIC_DATE_RE = re.compile(
+    r"\d|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b", re.IGNORECASE
+)
+
 
 class Anonymizer:
     def __init__(self) -> None:
@@ -87,6 +92,10 @@ class Anonymizer:
             entities=_ENTITIES,
             score_threshold=0.4,
         )
+        results = [
+            r for r in results
+            if r.entity_type != "DATE_TIME" or _SPECIFIC_DATE_RE.search(text[r.start:r.end])
+        ]
         result = anonymizer.anonymize(
             text=text,
             analyzer_results=results,

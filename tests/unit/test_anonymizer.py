@@ -121,3 +121,11 @@ class TestEdgeCases:
         engines_a = anon._load()
         engines_b = anon._load()
         assert engines_a is engines_b
+
+
+def test_relative_times_survive_but_dates_do_not():
+    from therapy_notes.anonymization.anonymizer import _SPECIFIC_DATE_RE as date
+    for kept in ("last week", "two years ago", "yesterday", "Tuesday"):
+        assert not date.search(kept), kept
+    for removed in ("March 3rd", "3/14/2026", "2019", "Sept"):
+        assert date.search(removed), removed

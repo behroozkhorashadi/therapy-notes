@@ -1,173 +1,282 @@
+"""Crash-safe audio capture: writes each track to its WAV file as it records.
+
+Audio callbacks only copy data into a queue. A writer thread saves it about once
+a second, keeping the WAV header valid, so a crash loses at most the last moment.
+
+macOS setup for capturing the client's side of a call is covered by the Setup
+window (BlackHole 2ch plus a Multi-Output Device).
+"""
 from __future__ import annotations
 
-"""
-Audio recorder that captures one or two input streams and saves them as
-separate WAV files (therapist mic + client loopback).
-
-macOS setup — capturing BOTH sides of a Zoom / Google Meet call
-================================================================
-By default, macOS only lets apps record the microphone. To also capture the
-client's voice coming through your speakers, you need a free virtual audio
-driver called BlackHole.
-
-One-time setup (takes ~5 minutes):
-
-1. Download and install BlackHole 2ch (free):
-   https://existential.audio/blackhole/
-
-2. Open "Audio MIDI Setup" (search in Spotlight).
-   Click the + button at the bottom-left → "Create Multi-Output Device".
-   In the right panel, check BOTH:
-     • Your normal speakers / headphones
-     • BlackHole 2ch
-   Rename it something like "Therapy Output".
-
-3. System Settings → Sound → Output → select "Therapy Output".
-   (You will still hear audio normally through your real speakers.)
-
-4. In Zoom (and Google Meet), set Audio Output to "Therapy Output".
-
-5. In your .env file, set:
-     AUDIO_LOOPBACK_DEVICE=BlackHole 2ch
-
-Run `uv run python tools/list_audio_devices.py` to confirm the device name.
-
-That's it. The recorder saves your microphone as audio_therapist.wav and
-the client's Zoom audio as audio_client.wav. The transcriber then produces
-a speaker-labelled transcript: Therapist: … / Client: …
-"""
-
-from dataclasses import dataclass
-from datetime import datetime
+import logging
+import os
+import queue
+import shutil
+import struct
+import threading
+import time
+import wave
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-import scipy.io.wavfile as wavfile
-import sounddevice as sd
+
+from ..session import CLIENT_AUDIO, THERAPIST_AUDIO
+
+log = logging.getLogger(__name__)
+
+SAMPLE_RATE = 16_000
+CHANNELS = 1
+DTYPE = "int16"
+SAMPLE_WIDTH = 2
+
+STALL_SECONDS = 5.0
+MIC_SILENCE_SECONDS = 60.0
+CLIENT_SILENCE_SECONDS = 120.0
+LOW_DISK_BYTES = 1024**3
+STOP_DISK_BYTES = 200 * 1024**2
+_SILENCE_PEAK = 8       # int16 peak at or below this counts as silence
+_STOP_TIMEOUT = 5.0     # macOS audio teardown can hang when a device has vanished
+
+Emit = Callable[[str, str, str], None]      # kind, code, message
+StreamFactory = Callable[..., object]
+
+
+def _default_stream_factory(device, callback):
+    import sounddevice as sd
+    return sd.InputStream(
+        device=device, samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE, callback=callback,
+    )
 
 
 @dataclass
-class RecordingResult:
-    """Paths produced by a single recording session."""
-    therapist_path: Path        # primary mic WAV
-    client_path: Optional[Path] # loopback WAV — None when no loopback device
-    session_dir: Path
+class _Track:
+    label: str
+    device: object
+    path: Path
+    required: bool
+    silence_limit: float
+    silence_message: str
+    frames: int = 0
+    overflows: int = 0
+    dropped: int = 0
+    peak: int = 0
+    silent_for: float = 0.0
+    silence_warned: bool = False
+    stall_warned: bool = False
+    last_callback: float = 0.0
+    queue: "queue.Queue[np.ndarray]" = field(default_factory=lambda: queue.Queue(maxsize=2000))
+    stream: object = None
+    wav: Optional[wave.Wave_write] = None
 
-SAMPLE_RATE = 16_000   # 16 kHz — matches Whisper's native rate, sufficient for speech
-CHANNELS = 1
-DTYPE = "int16"
+    def callback(self, indata, frames, time_info, status) -> None:
+        self.last_callback = time.monotonic()
+        if status:
+            self.overflows += 1
+        try:
+            self.queue.put_nowait(indata.copy())
+        except queue.Full:
+            self.dropped += frames
 
 
-class AudioRecorder:
+class StreamingRecorder:
     def __init__(
         self,
-        output_dir: Path,
-        primary_device: Optional[str | int] = None,
-        loopback_device: Optional[str | int] = None,
-        on_level: Optional[Callable[[float], None]] = None,
+        session_dir: Path,
+        primary_device=None,
+        loopback_device=None,
+        emit: Optional[Emit] = None,
+        stream_factory: StreamFactory = _default_stream_factory,
+        interval: float = 1.0,
     ) -> None:
-        self.output_dir = output_dir
-        self.primary_device = primary_device    # None = system default mic
-        self.loopback_device = loopback_device  # e.g. "BlackHole 2ch"
-        self.on_level = on_level                # callback(rms: float 0–1)
+        self.session_dir = session_dir
+        self._emit = emit or (lambda kind, code, message: None)
+        self._factory = stream_factory
+        self._interval = interval
+        self._stop_writer = threading.Event()
+        self._writer: Optional[threading.Thread] = None
+        self.fatal: Optional[str] = None
+        self.tracks = [_Track(
+            "Microphone", primary_device, session_dir / THERAPIST_AUDIO, True, MIC_SILENCE_SECONDS,
+            "The microphone has been silent for a minute. Check that it isn't muted.",
+        )]
+        if loopback_device is not None:
+            self.tracks.append(_Track(
+                "Client audio", loopback_device, session_dir / CLIENT_AUDIO, False, CLIENT_SILENCE_SECONDS,
+                "No client audio for two minutes. Check that Zoom's speaker is set to Therapy Output.",
+            ))
 
-        self._recording = False
-        self._primary_chunks: list[np.ndarray] = []
-        self._loopback_chunks: list[np.ndarray] = []
-        self._primary_stream: Optional[sd.InputStream] = None
-        self._loopback_stream: Optional[sd.InputStream] = None
-        self._session_dir: Optional[Path] = None
+    def start(self) -> None:
+        """Open the streams. Raises if the microphone can't start."""
+        for track in list(self.tracks):
+            try:
+                self._open(track)
+            except Exception as exc:  # noqa: BLE001 - audio errors have no shared base class
+                self._close_wav(track)
+                track.path.unlink(missing_ok=True)
+                if track.required:
+                    self._teardown()
+                    raise
+                log.warning("Could not open client audio: %s", exc)
+                self._emit("warning", "client_unavailable",
+                           "Client audio could not start, so only the microphone is recording. Check Setup.")
+                self.tracks.remove(track)
+        self._writer = threading.Thread(target=self._write_loop, name="writer", daemon=True)
+        self._writer.start()
 
-    # ── Public interface ──────────────────────────────────────────────────────
+    def _open(self, track: _Track) -> None:
+        track.wav = wave.open(str(track.path), "wb")
+        track.wav.setnchannels(CHANNELS)
+        track.wav.setsampwidth(SAMPLE_WIDTH)
+        track.wav.setframerate(SAMPLE_RATE)
+        track.last_callback = time.monotonic()
+        track.stream = self._factory(track.device, track.callback)
+        track.stream.start()
 
-    def start(self) -> Path:
-        """Begin recording. Returns the session directory path."""
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        session_dir = self.output_dir / timestamp
-        session_dir.mkdir(parents=True, exist_ok=True)
-        self._session_dir = session_dir
+    def _write_loop(self) -> None:
+        last_sync = time.monotonic()
+        last_disk = 0.0
+        while not self._stop_writer.wait(self._interval):
+            try:
+                self._drain()
+                now = time.monotonic()
+                if now - last_sync >= 10:
+                    self._sync()
+                    last_sync = now
+                if now - last_disk >= 30:
+                    self._check_disk()
+                    last_disk = now
+                self._check_tracks(now)
+                self._emit("status", "", "")
+            except OSError as exc:
+                self.fatal = f"Could not save audio: {exc}"
+                log.error(self.fatal)
+                self._emit("fatal", "write_failed", self.fatal)
+                return
 
-        self._recording = True
-        self._primary_chunks = []
-        self._loopback_chunks = []
+    def _drain(self) -> float:
+        """Write queued audio. Returns the seconds written for the first track."""
+        written = 0.0
+        for index, track in enumerate(self.tracks):
+            chunks = []
+            while True:
+                try:
+                    chunks.append(track.queue.get_nowait())
+                except queue.Empty:
+                    break
+            track.peak = 0
+            if not chunks:
+                continue
+            data = np.concatenate(chunks)
+            track.wav.writeframes(data.tobytes())
+            track.frames += len(data)
+            track.peak = int(np.abs(data.astype(np.int32)).max())
+            seconds = len(data) / SAMPLE_RATE
+            track.silent_for = track.silent_for + seconds if track.peak <= _SILENCE_PEAK else 0.0
+            if index == 0:
+                written = seconds
+        return written
 
-        self._primary_stream = sd.InputStream(
-            device=self.primary_device,
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype=DTYPE,
-            callback=self._primary_cb,
-        )
-        self._primary_stream.start()
+    def _sync(self) -> None:
+        for track in self.tracks:
+            handle = getattr(track.wav, "_file", None)
+            if handle is not None:
+                handle.flush()
+                os.fsync(handle.fileno())
 
-        if self.loopback_device is not None:
-            self._loopback_stream = sd.InputStream(
-                device=self.loopback_device,
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype=DTYPE,
-                callback=self._loopback_cb,
-            )
-            self._loopback_stream.start()
+    def _check_disk(self) -> None:
+        free = shutil.disk_usage(self.session_dir).free
+        if free < STOP_DISK_BYTES:
+            self.fatal = "The disk is nearly full, so recording stopped. The audio so far is saved."
+            self._emit("fatal", "disk_full", self.fatal)
+            self._stop_writer.set()
+        elif free < LOW_DISK_BYTES:
+            self._emit("warning", "disk_low", "Less than 1 GB of disk space left. Free up space soon.")
 
-        return self._session_dir
+    def _check_tracks(self, now: float) -> None:
+        for track in self.tracks:
+            if now - track.last_callback > STALL_SECONDS:
+                if not track.stall_warned:
+                    track.stall_warned = True
+                    log.warning("%s stopped delivering audio", track.label)
+                    self._emit("warning", "stalled",
+                               f"{track.label} stopped sending audio. The device may have been disconnected.")
+            else:
+                track.stall_warned = False
+            if track.silent_for >= track.silence_limit:
+                if not track.silence_warned:
+                    track.silence_warned = True
+                    self._emit("warning", "silent", track.silence_message)
+            else:
+                track.silence_warned = False
 
-    def stop(self) -> RecordingResult:
-        """Stop recording, write WAV files, and return a RecordingResult."""
-        self._recording = False
+    def _teardown(self) -> None:
+        """Stop the streams, without letting a hung audio device block saving."""
+        def close_streams() -> None:
+            for track in self.tracks:
+                if track.stream is None:
+                    continue
+                try:
+                    track.stream.stop()
+                    track.stream.close()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Error closing %s stream: %s", track.label, exc)
 
-        for stream in (self._primary_stream, self._loopback_stream):
-            if stream:
-                stream.stop()
-                stream.close()
-        self._primary_stream = None
-        self._loopback_stream = None
+        closer = threading.Thread(target=close_streams, daemon=True)
+        closer.start()
+        closer.join(_STOP_TIMEOUT)
+        if closer.is_alive():
+            log.warning("Audio device did not close in time; saving anyway")
 
-        session_dir = self._session_dir
+    def _close_wav(self, track: _Track) -> None:
+        if track.wav is not None:
+            try:
+                track.wav.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Error closing %s file: %s", track.label, exc)
+            track.wav = None
 
-        primary = (
-            np.concatenate(self._primary_chunks, axis=0)
-            if self._primary_chunks
-            else np.zeros((SAMPLE_RATE, 1), dtype=DTYPE)
-        )
-        therapist_path = session_dir / "audio_therapist.wav"
-        wavfile.write(str(therapist_path), SAMPLE_RATE, primary.flatten())
+    def stop(self) -> dict:
+        """Stop and save everything. Returns a summary of what was captured."""
+        self._teardown()
+        self._stop_writer.set()
+        if self._writer is not None and self._writer is not threading.current_thread():
+            self._writer.join(_STOP_TIMEOUT)
+        try:
+            self._drain()
+        except OSError as exc:
+            self.fatal = f"Could not save audio: {exc}"
+        summary: dict = {"warnings": []}
+        for track in self.tracks:
+            self._close_wav(track)
+            if track.overflows or track.dropped:
+                log.warning("%s: %d overflows, %d dropped frames", track.label, track.overflows, track.dropped)
+                summary["warnings"].append(
+                    f"{track.label} had brief audio dropouts during recording, so the transcript may have gaps."
+                )
+        summary["seconds"] = self.tracks[0].frames / SAMPLE_RATE
+        return summary
 
-        client_path: Optional[Path] = None
-        if self._loopback_chunks:
-            loopback = np.concatenate(self._loopback_chunks, axis=0)
-            client_path = session_dir / "audio_client.wav"
-            wavfile.write(str(client_path), SAMPLE_RATE, loopback.flatten())
+    def levels(self) -> dict:
+        return {
+            "peaks": [track.peak / 32768 for track in self.tracks],
+            "seconds": self.tracks[0].frames / SAMPLE_RATE,
+        }
 
-        return RecordingResult(
-            therapist_path=therapist_path,
-            client_path=client_path,
-            session_dir=session_dir,
-        )
 
-    @property
-    def session_dir(self) -> Optional[Path]:
-        return self._session_dir
-
-    # ── Stream callbacks (called from audio thread) ───────────────────────────
-
-    def _primary_cb(self, indata: np.ndarray, frames: int, time, status) -> None:
-        if not self._recording:
-            return
-        chunk = indata.copy()
-        self._primary_chunks.append(chunk)
-        if self.on_level:
-            rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768.0
-            self.on_level(min(rms * 12, 1.0))
-
-    def _loopback_cb(self, indata: np.ndarray, frames: int, time, status) -> None:
-        if self._recording:
-            self._loopback_chunks.append(indata.copy())
-
-    # ── Utility ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def list_devices() -> None:
-        """Print all available audio devices. Run tools/list_audio_devices.py."""
-        print(sd.query_devices())
+def repair_wav(path: Path) -> float:
+    """Make a WAV's header match its data after a crash. Returns its seconds."""
+    size = path.stat().st_size
+    if size < 44:
+        raise ValueError(f"{path.name} is too small to be audio")
+    data_bytes = size - 44
+    with open(path, "r+b") as handle:
+        header = handle.read(44)
+        if header[:4] != b"RIFF" or header[36:40] != b"data":
+            raise ValueError(f"{path.name} is not a recoverable WAV file")
+        handle.seek(4)
+        handle.write(struct.pack("<I", size - 8))
+        handle.seek(40)
+        handle.write(struct.pack("<I", data_bytes))
+    return data_bytes / (SAMPLE_RATE * SAMPLE_WIDTH)

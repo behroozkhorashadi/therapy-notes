@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import os
-import re
+import importlib.util
+import json
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
-import time
+import webbrowser
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
@@ -28,48 +27,20 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..audio.recorder import AudioRecorder
-from ..config import config
-from ..transcription.transcriber import Transcriber
+from ..config import config, reload_config
+from ..models import recommend_models
+from ..setup_tasks import MIC_RECORD_SECONDS as _MIC_RECORD_SECONDS
+from ..setup_tasks import MIC_SCRIPT as _MIC_SCRIPT
+from ..setup_tasks import word_match as _word_match  # noqa: F401 - used by tests
 from ..utils.env import save_env_value
+from .processes import module_command, module_env
 
 # ── Test constants ────────────────────────────────────────────────────────────
 
-# Script shown to the therapist to read aloud during the mic test.
-# Chosen for phonetic variety and natural cadence.
-_MIC_SCRIPT = (
-    "Good morning. Testing the audio recording system. "
-    "My name is Sarah and I am conducting a telehealth session today. "
-    "One, two, three, four, five."
-)
-
-# Phrase spoken by macOS `say` during the loopback test.
-_LOOPBACK_PHRASE = "Testing system audio capture. One two three four five. Audio check complete."
-
 _MATCH_THRESHOLD = 0.50   # 50% word overlap = pass
-_MIC_RECORD_SECONDS = 10
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _word_match(expected: str, actual: str) -> float:
-    """Return fraction of expected words found anywhere in actual."""
-    clean = lambda s: re.sub(r"[^\w\s]", "", s.lower())
-    exp = set(clean(expected).split())
-    act = set(clean(actual).split())
-    if not exp:
-        return 0.0
-    return len(exp & act) / len(exp)
-
-
-def _blackhole_loaded() -> bool:
-    """True if BlackHole 2ch is visible as an active audio device."""
-    try:
-        from ..audio.devices import find_device
-        return find_device("BlackHole 2ch", kind="input") is not None
-    except Exception:
-        return False
-
 
 def _blackhole_installed() -> bool:
     """True if the BlackHole HAL driver file exists on disk (may not be loaded yet)."""
@@ -81,17 +52,27 @@ def _homebrew_available() -> bool:
 
 
 def _api_key_ok() -> bool:
-    if config.ai_provider == "anthropic":
-        return bool(config.anthropic_api_key)
-    return bool(config.openai_api_key)
+    return not config.validate() or not any("API_KEY" in error for error in config.validate())
 
 
 def _spacy_model_installed() -> bool:
+    return importlib.util.find_spec("en_core_web_lg") is not None
+
+
+def _run_task(task: str, timeout: float) -> dict:
+    """Run a setup task in its own process. Its result is the last line of output."""
     try:
-        import spacy
-        return spacy.util.is_package("en_core_web_lg")
-    except Exception:
-        return False
+        result = subprocess.run(
+            module_command("setup_tasks", task), capture_output=True, text=True,
+            timeout=timeout, env=module_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "The test timed out. Audio devices may not be responding."}
+    lines = result.stdout.strip().splitlines()
+    try:
+        return json.loads(lines[-1])
+    except (IndexError, ValueError):
+        return {"error": (result.stderr.strip() or "The test failed.")[-300:]}
 
 
 # ── Per-test signals (must be class-level attrs on a QObject subclass) ────────
@@ -111,6 +92,14 @@ class _SpacySignals(QObject):
     error = pyqtSignal(str)
 
 
+class _DeviceSignals(QObject):
+    result = pyqtSignal(bool)   # BlackHole visible to Core Audio
+
+
+class _PingSignals(QObject):
+    done = pyqtSignal(bool)
+
+
 class _UpdateSignals(QObject):
     ok    = pyqtSignal(str)   # summary of what changed
     error = pyqtSignal(str)
@@ -123,14 +112,13 @@ class SetupWindow(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Therapy Notes — Setup & Test")
-        self.setMinimumSize(660, 560)
-        self.resize(660, 720)
+        self.setMinimumSize(820, 560)
+        self.resize(820, 720)
 
         self._mic_countdown = _MIC_RECORD_SECONDS
-        self._mic_timer = QTimer()
+        self._mic_timer = QTimer(self)
         self._mic_timer.setInterval(1000)
         self._mic_timer.timeout.connect(self._mic_tick)
-        self._mic_recorder: AudioRecorder | None = None
 
         self._build_ui()
         # Auto-check silent items on open
@@ -145,6 +133,7 @@ class SetupWindow(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         outer.addWidget(scroll)
 
         container = QWidget()
@@ -243,7 +232,7 @@ class SetupWindow(QDialog):
         ollama_row = QHBoxLayout()
         ollama_row.addWidget(QLabel("Model:"))
         self._ollama_model_input = QLineEdit()
-        self._ollama_model_input.setPlaceholderText("llama3.1")
+        self._ollama_model_input.setPlaceholderText(recommend_models().local_llm or "qwen3.5:9b")
         self._ollama_model_input.setText(config.ollama_model)
         ollama_row.addWidget(self._ollama_model_input)
         ollama_row.addStretch()
@@ -251,6 +240,23 @@ class SetupWindow(QDialog):
         self._ollama_widget.setLayout(ollama_row)
         self._api.col.addWidget(self._ollama_widget)
 
+        # Indeterminate progress bar — visible only while Ollama model test runs
+        self._api_progress = QProgressBar()
+        self._api_progress.setRange(0, 0)
+        self._api_progress.setFixedHeight(4)
+        self._api_progress.setTextVisible(False)
+        self._api_progress.setVisible(False)
+        self._api.col.addWidget(self._api_progress)
+
+        # Set the initial state before wiring, so opening the window changes nothing.
+        p = config.ai_provider
+        if p == "openai":
+            self._rb_openai.setChecked(True)
+        elif p == "ollama":
+            self._rb_ollama.setChecked(True)
+        else:
+            self._rb_anthropic.setChecked(True)
+        self._update_provider_ui()  # show/hide correct input row
         # Wire provider radio buttons — toggled fires for both check and uncheck,
         # so guard with `on` to only react once per change.
         self._rb_anthropic.toggled.connect(
@@ -263,30 +269,18 @@ class SetupWindow(QDialog):
             lambda on: on and self._on_provider_change("ollama")
         )
 
-        # Indeterminate progress bar — visible only while Ollama model test runs
-        self._api_progress = QProgressBar()
-        self._api_progress.setRange(0, 0)
-        self._api_progress.setFixedHeight(4)
-        self._api_progress.setTextVisible(False)
-        self._api_progress.setVisible(False)
-        self._api.col.addWidget(self._api_progress)
-
-        # Set initial radio state from config (no signal emitted yet)
-        p = config.ai_provider
-        if p == "openai":
-            self._rb_openai.setChecked(True)
-        elif p == "ollama":
-            self._rb_ollama.setChecked(True)
-        else:
-            self._rb_anthropic.setChecked(True)
-        self._update_provider_ui()  # show/hide correct input row
+        rec = recommend_models()
+        rec_label = QLabel(f"Recommended here: {rec.summary}")
+        rec_label.setWordWrap(True)
+        rec_label.setStyleSheet("color: gray; font-size: 11px;")
+        self._api.col.addWidget(rec_label)
 
         # ── Step 4: spaCy Language Model ──────────────────────────────────────
         self._spacy = self._step(
             "Step 4 — Anonymization Model",
-            "Downloads the English NLP model (en_core_web_lg, ~560 MB) that "
-            "Presidio uses to detect and redact names, locations, and other "
-            "identifying information from session transcripts. Only needed once.",
+            "The English NLP model (en_core_web_lg) that Presidio uses to redact "
+            "names, locations, and other identifying details from transcripts "
+            "before they go to a cloud provider. Normally installed with the app.",
             btn="Check / Download",
         )
         self._spacy.btn.clicked.connect(self._check_spacy)
@@ -303,11 +297,10 @@ class SetupWindow(QDialog):
         self._mic = self._step(
             f"Step 5 — Microphone Test  ({_MIC_RECORD_SECONDS}s recording)",
             f"Read this aloud when the recording starts:\n\n{script_preview}\n\n"
-            "Whisper will transcribe the recording and check how well it matches.\n\n"
-            "⚠ First run only: the Whisper model (~250 MB) will download before "
-            "transcription begins. This is a one-time step — subsequent tests and "
-            "sessions will be fast.",
-            btn=f"Record & Test ({_MIC_RECORD_SECONDS}s)",
+            "The speech model will transcribe it and check how well it matches.\n\n"
+            "⚠ First run only: the speech model downloads before transcription "
+            "begins. This is a one-time step.",
+            btn=f"Record && Test ({_MIC_RECORD_SECONDS}s)",
         )
         self._mic.btn.clicked.connect(self._start_mic_test)
 
@@ -329,11 +322,10 @@ class SetupWindow(QDialog):
         zoom_l.setContentsMargins(14, 10, 14, 10)
         zoom_l.addWidget(QLabel("ℹ  About Zoom"))
         note = QLabel(
-            "Zoom cannot be tested automatically, but Step 5 validates the same "
-            "audio path. If Step 5 passes, you know:\n"
+            "Zoom cannot be tested automatically, but Step 6 validates the same "
+            "audio path. If Step 6 passes, you know:\n"
             "  • BlackHole is installed and receiving audio\n"
-            "  • Your speakers are routing through BlackHole\n"
-            "  • Whisper transcription is working\n\n"
+            "  • Your speakers are routing through BlackHole\n\n"
             "The one manual step for Zoom: open Zoom → Settings → Audio → "
             "Speaker and set it to your Multi-Output Device. Google Meet follows "
             "the system default automatically, so Step 2 is sufficient."
@@ -459,14 +451,31 @@ class SetupWindow(QDialog):
     # ── Auto-check (runs on open) ─────────────────────────────────────────────
 
     def _auto_check(self) -> None:
+        """Quick, read-only checks on open. Nothing downloads, loads or writes."""
         self._refresh_blackhole()
-        self._check_provider()
-        self._check_spacy()
+        if config.ai_provider == "ollama":
+            self._ping_ollama()
+        else:
+            self._check_api_key()
+        if _spacy_model_installed():
+            self._spacy.set_ok("en_core_web_lg is installed.")
+        else:
+            self._spacy.set_warn("Not installed yet. Click Check / Download (~560 MB).")
 
     # ── Step 1: BlackHole ─────────────────────────────────────────────────────
 
     def _refresh_blackhole(self) -> None:
-        if _blackhole_loaded():
+        signals = _DeviceSignals(self)
+        signals.result.connect(self._on_blackhole_checked)
+
+        def task() -> None:
+            result = _run_task("devices", timeout=20)
+            signals.result.emit(bool(result.get("blackhole")))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_blackhole_checked(self, loaded: bool) -> None:
+        if loaded:
             self._bh.set_ok("BlackHole 2ch is installed and loaded.")
         elif _blackhole_installed():
             # Driver file is on disk but Core Audio hasn't loaded it
@@ -491,21 +500,18 @@ class SetupWindow(QDialog):
 
     def _handle_blackhole(self) -> None:
         if _blackhole_installed():
-            self._bh.set_ok("Already installed.")
+            self._refresh_blackhole()
             return
 
         if _homebrew_available():
             # brew install requires sudo for the .pkg step, which needs an
             # interactive terminal to accept a password. Open Terminal so the
             # user can see the prompt and type their password normally.
-            subprocess.run(
-                [
-                    "osascript",
-                    "-e", 'tell application "Terminal" to activate',
-                    "-e", 'tell application "Terminal" to do script "brew install blackhole-2ch"',
-                ],
-                check=False,
-            )
+            subprocess.Popen([
+                "osascript",
+                "-e", 'tell application "Terminal" to activate',
+                "-e", 'tell application "Terminal" to do script "brew install blackhole-2ch"',
+            ])
             self._bh.status.setText("⏳")
             self._bh.status.setStyleSheet("color: orange;")
             self._bh.set_info(
@@ -515,7 +521,6 @@ class SetupWindow(QDialog):
                 "Check / Install again to verify."
             )
         else:
-            import webbrowser
             webbrowser.open("https://existential.audio/blackhole/")
             self._bh.set_warn(
                 "Homebrew not found — download page opened in your browser.\n"
@@ -524,14 +529,11 @@ class SetupWindow(QDialog):
 
     def _restart_coreaudio(self) -> None:
         """Restart the Core Audio server via a Terminal window (requires sudo)."""
-        subprocess.run(
-            [
-                "osascript",
-                "-e", 'tell application "Terminal" to activate',
-                "-e", 'tell application "Terminal" to do script "sudo killall coreaudiod"',
-            ],
-            check=False,
-        )
+        subprocess.Popen([
+            "osascript",
+            "-e", 'tell application "Terminal" to activate',
+            "-e", 'tell application "Terminal" to do script "sudo killall coreaudiod"',
+        ])
         self._bh.set_info(
             "A Terminal window has opened. Enter your Mac password to restart "
             "the audio server.\n"
@@ -541,7 +543,7 @@ class SetupWindow(QDialog):
     # ── Step 2: Multi-Output Device ───────────────────────────────────────────
 
     def _open_audio_midi(self) -> None:
-        subprocess.run(["open", "-a", "Audio MIDI Setup"], check=False)
+        subprocess.Popen(["open", "-a", "Audio MIDI Setup"])
 
     # ── Step 3: AI Provider ───────────────────────────────────────────────────
 
@@ -571,29 +573,42 @@ class SetupWindow(QDialog):
             self._api.set_fail("No API key found — paste it below.")
             self._api_save_btn.setText("Save to .env")
 
-    def _check_ollama(self) -> None:
-        import urllib.request
-        model = self._ollama_model_input.text().strip() or "llama3.1"
+    def _ping_ollama(self) -> None:
+        """Quick reachability check, off the UI thread. Doesn't load a model."""
+        url = config.ollama_base_url
+        signals = _PingSignals(self)
+        signals.done.connect(self._on_ollama_ping)
 
-        # Phase 1 — quick server ping (synchronous, fast)
-        try:
-            urllib.request.urlopen(f"{config.ollama_base_url}/api/tags", timeout=3)
-        except Exception:
+        def task() -> None:
+            import urllib.request
+            try:
+                urllib.request.urlopen(f"{url}/api/tags", timeout=3)
+                signals.done.emit(True)
+            except OSError:
+                signals.done.emit(False)
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_ollama_ping(self, reachable: bool) -> None:
+        if reachable:
+            self._api.set_info("Ollama is running. Click Check Connection to test the model.")
+        else:
             self._api.set_fail(
                 f"Cannot reach Ollama at {config.ollama_base_url}.\n"
-                "Install from ollama.com, then run:  ollama pull llama3.1"
+                f"Install from ollama.com, then run:  ollama pull {config.ollama_model}"
             )
-            return
 
-        # Server is up — save model name, then test it in the background
+    def _check_ollama(self) -> None:
+        """Send a real test prompt. Loads the model, so only runs when asked."""
+        model = self._ollama_model_input.text().strip() or config.ollama_model
         save_env_value("OLLAMA_MODEL", model)
         config.ollama_model = model
         self._api.btn.setEnabled(False)
         self._api.btn.setText("Testing model…")
-        self._api.set_info(f"Ollama is running. Sending test prompt to {model}…")
+        self._api.set_info(f"Sending a test prompt to {model}…")
         self._api_progress.setVisible(True)
 
-        sigs = _OllamaSignals()
+        sigs = _OllamaSignals(self)
         sigs.ok.connect(self._on_ollama_ok)
         sigs.error.connect(self._on_ollama_error)
         threading.Thread(
@@ -631,14 +646,14 @@ class SetupWindow(QDialog):
             "ANTHROPIC_API_KEY" if config.ai_provider == "anthropic" else "OPENAI_API_KEY"
         )
         save_env_value(key_name, key)
-        config.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        config.openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        reload_config()
         self._api_key_input.clear()
         self._check_api_key()
 
     # ── Step 4: spaCy Model ───────────────────────────────────────────────────
 
     def _check_spacy(self) -> None:
+        """Runs on click only, so a large download never starts by surprise."""
         if _spacy_model_installed():
             self._spacy.set_ok("en_core_web_lg is installed.")
         else:
@@ -650,7 +665,7 @@ class SetupWindow(QDialog):
         self._spacy.set_info("Downloading en_core_web_lg (~560 MB)…")
         self._spacy_progress.setVisible(True)
 
-        sigs = _SpacySignals()
+        sigs = _SpacySignals(self)
         sigs.ok.connect(self._on_spacy_ok)
         sigs.error.connect(self._on_spacy_error)
         threading.Thread(target=_download_spacy_model, args=(sigs,), daemon=True).start()
@@ -676,46 +691,34 @@ class SetupWindow(QDialog):
         self._mic.status.setText("⏺")
         self._mic.status.setStyleSheet("color: #e74c3c; font-size: 16px;")
         self._mic.result.setText("Read the script aloud now!")
-        self._mic.result.setStyleSheet("color: white; font-size: 12px;")
-
-        tmpdir = Path(tempfile.mkdtemp())
-        self._mic_recorder = AudioRecorder(
-            output_dir=tmpdir,
-            primary_device=config.audio_primary_device,
-        )
-        self._mic_recorder.start()
+        self._mic.result.setStyleSheet("font-size: 12px;")
         self._mic_timer.start()
+
+        signals = _TestSignals(self)
+        signals.result.connect(self._on_mic_result)
+        signals.error.connect(lambda m: self._on_test_error(self._mic, m))
+        # First run may download the speech model, so allow plenty of time.
+        threading.Thread(target=_run_test_task, args=("mic-test", 1800, signals), daemon=True).start()
 
     def _mic_tick(self) -> None:
         self._mic_countdown -= 1
         if self._mic_countdown > 0:
             self._mic.btn.setText(f"Recording...  {self._mic_countdown}s")
             return
-
         self._mic_timer.stop()
-        recording = self._mic_recorder.stop()
-        audio_path = recording.therapist_path
         self._mic.btn.setText("Transcribing...")
         self._mic.status.setText("⏳")
         self._mic.status.setStyleSheet("color: orange; font-size: 16px;")
         self._mic.result.setText(
-            "Transcribing — if this is the first run, the Whisper model is "
-            "downloading (~250 MB). This will be fast on future runs."
+            "Transcribing — on the first run, the speech model downloads first. "
+            "Future runs will be fast."
         )
         self._mic.result.setStyleSheet("color: gray; font-size: 12px;")
 
-        signals = _TestSignals()
-        signals.result.connect(self._on_mic_result)
-        signals.error.connect(lambda m: self._on_test_error(self._mic, m))
-        threading.Thread(
-            target=_transcribe_and_compare,
-            args=(audio_path, _MIC_SCRIPT, signals),
-            daemon=True,
-        ).start()
-
     def _on_mic_result(self, transcript: str, ratio: float) -> None:
+        self._mic_timer.stop()
         self._mic.btn.setEnabled(True)
-        self._mic.btn.setText(f"Record & Test ({_MIC_RECORD_SECONDS}s)")
+        self._mic.btn.setText(f"Record && Test ({_MIC_RECORD_SECONDS}s)")
         _apply_result(self._mic, transcript, ratio)
 
     # ── Step 5: Loopback Test ─────────────────────────────────────────────────
@@ -734,14 +737,10 @@ class SetupWindow(QDialog):
         self._lb.result.setText("Playing tone to Therapy Output and recording from BlackHole...")
         self._lb.result.setStyleSheet("color: gray; font-size: 12px;")
 
-        signals = _TestSignals()
+        signals = _TestSignals(self)
         signals.result.connect(self._on_loopback_result)
         signals.error.connect(lambda m: self._on_test_error(self._lb, m))
-        threading.Thread(
-            target=_run_loopback_capture,
-            args=(signals,),
-            daemon=True,
-        ).start()
+        threading.Thread(target=_run_test_task, args=("loopback-test", 60, signals), daemon=True).start()
 
     def _on_loopback_result(self, transcript: str, ratio: float) -> None:
         self._lb.btn.setEnabled(True)
@@ -756,7 +755,7 @@ class SetupWindow(QDialog):
         self._update.set_info("Running git pull…")
         self._update_progress.setVisible(True)
 
-        sigs = _UpdateSignals()
+        sigs = _UpdateSignals(self)
         sigs.ok.connect(self._on_update_ok)
         sigs.error.connect(self._on_update_error)
         threading.Thread(target=_do_update, args=(sigs,), daemon=True).start()
@@ -776,9 +775,10 @@ class SetupWindow(QDialog):
     # ── Shared error handler ──────────────────────────────────────────────────
 
     def _on_test_error(self, step: _Step, msg: str) -> None:
+        self._mic_timer.stop()
         step.btn.setEnabled(True)
         if step is self._mic:
-            step.btn.setText(f"Record & Test ({_MIC_RECORD_SECONDS}s)")
+            step.btn.setText(f"Record && Test ({_MIC_RECORD_SECONDS}s)")
         elif step is self._lb:
             step.btn.setText("Run Test")
         step.set_fail(f"Error: {msg}")
@@ -786,103 +786,28 @@ class SetupWindow(QDialog):
 
 # ── Pure functions run in background threads ──────────────────────────────────
 
-def _transcribe_and_compare(
-    audio_path: Path, expected: str, signals: _TestSignals
-) -> None:
-    try:
-        transcript = Transcriber(config.whisper_model).transcribe(audio_path)
-        ratio = _word_match(expected, transcript)
-        signals.result.emit(transcript.strip(), ratio)
-    except Exception as exc:
-        signals.error.emit(str(exc))
-
-
-def _run_loopback_capture(signals: _TestSignals) -> None:
-    """Play a 440 Hz tone to 'Therapy Output' and record from BlackHole 2ch."""
-    try:
-        import sounddevice as sd
-        import numpy as np
-        from therapy_notes.audio.devices import find_device
-
-        SAMPLE_RATE = 16_000
-        DURATION = 3
-        TONE_HZ = 440
-        SIGNAL_THRESHOLD = 0.005
-
-        # Locate required devices
-        blackhole_idx = find_device("BlackHole 2ch", kind="input")
-        therapy_idx = find_device("Therapy Output", kind="output")
-
-        if blackhole_idx is None:
-            signals.error.emit(
-                "BlackHole 2ch input device not found. "
-                "Complete Step 1 and restart Core Audio."
-            )
-            return
-        if therapy_idx is None:
-            signals.error.emit(
-                "'Therapy Output' device not found. "
-                "Create the Multi-Output Device in Step 2 first."
-            )
-            return
-
-        # Generate tone
-        t = np.linspace(0, DURATION, int(SAMPLE_RATE * DURATION), endpoint=False)
-        tone = (0.4 * np.sin(2 * np.pi * TONE_HZ * t)).astype(np.float32)
-
-        recorded: list = []
-
-        def _cb(indata, frames, time_info, status):
-            recorded.append(indata.copy())
-
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            device=blackhole_idx,
-            callback=_cb,
-            dtype="float32",
-        ):
-            sd.play(tone, samplerate=SAMPLE_RATE, device=therapy_idx, blocking=True)
-            time.sleep(0.3)
-
-        if not recorded:
-            signals.result.emit("Nothing captured from BlackHole 2ch.", 0.0)
-            return
-
-        captured = np.concatenate(recorded).flatten()
-        peak = float(np.max(np.abs(captured)))
-
-        if peak >= SIGNAL_THRESHOLD:
-            signals.result.emit(f"Tone captured cleanly  (peak={peak:.3f})", 1.0)
-        else:
-            signals.result.emit(
-                f"Signal too weak  (peak={peak:.4f})\n"
-                "Make sure 'Therapy Output' is selected as your system speaker output "
-                "and that BlackHole 2ch is checked in the Multi-Output Device.",
-                0.0,
-            )
-    except Exception as exc:
-        signals.error.emit(str(exc))
+def _run_test_task(task: str, timeout: float, signals: _TestSignals) -> None:
+    result = _run_task(task, timeout)
+    if "error" in result:
+        signals.error.emit(str(result["error"]))
+    else:
+        signals.result.emit(result.get("transcript", ""), float(result.get("ratio", 0.0)))
 
 
 def _run_ollama_test(base_url: str, model: str, signals: _OllamaSignals) -> None:
     """Send a short test prompt to Ollama and emit the reply."""
+    import urllib.request
     try:
-        import openai as _openai
-        client = _openai.OpenAI(base_url=f"{base_url}/v1", api_key="ollama")
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Reply with one sentence only: confirm you are ready "
-                    "to assist with clinical documentation."
-                ),
-            }],
-            max_tokens=60,
+        body = {
+            "model": model, "stream": False, "options": {"num_predict": 60},
+            "messages": [{"role": "user", "content": "Reply with one sentence confirming you are ready."}],
+        }
+        request = urllib.request.Request(
+            f"{base_url}/api/chat", data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
         )
-        reply = response.choices[0].message.content.strip()
-        signals.ok.emit(reply)
+        with urllib.request.urlopen(request, timeout=300) as response:
+            signals.ok.emit(json.load(response)["message"]["content"].strip())
     except Exception as exc:
         signals.error.emit(str(exc))
 
@@ -896,6 +821,7 @@ def _do_update(signals: _UpdateSignals) -> None:
             capture_output=True,
             text=True,
             cwd=repo_root,
+            timeout=120,
         )
         if pull.returncode != 0:
             signals.error.emit(pull.stderr.strip() or pull.stdout.strip())
@@ -909,6 +835,7 @@ def _do_update(signals: _UpdateSignals) -> None:
                 capture_output=True,
                 text=True,
                 cwd=repo_root,
+                timeout=900,
             )
             if sync.returncode != 0:
                 signals.error.emit(sync.stderr.strip() or sync.stdout.strip())

@@ -75,3 +75,34 @@ class TestFieldValidation:
         cfg = mock_config(TEMPLATE_FILE="/nonexistent/template.txt")
         errors = cfg.validate()
         assert any("template" in e.lower() for e in errors)
+
+
+class TestPlaceholderAndPaths:
+    def test_placeholder_key_is_not_a_key(self, mock_config):
+        errors = mock_config(ANTHROPIC_API_KEY="your_anthropic_key_here").validate()
+        assert any("ANTHROPIC_API_KEY" in e for e in errors)
+
+    def test_relative_paths_ignore_launch_folder(self, mock_config, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        from therapy_notes.config import REPO_ROOT
+        cfg = mock_config(SESSIONS_DIR="./sessions", TEMPLATE_FILE="./templates/notes_template.txt")
+        assert cfg.sessions_dir == REPO_ROOT / "sessions"
+        assert cfg.template_file.exists()
+
+    def test_bad_number_uses_default(self, mock_config):
+        assert mock_config(SESSION_DURATION_MINUTES="abc").session_duration_minutes == 55
+
+    def test_invalid_asr_engine(self, mock_config):
+        assert any("ASR_ENGINE" in e for e in mock_config(ASR_ENGINE="nope").validate())
+
+    def test_reload_updates_shared_object(self, monkeypatch, tmp_path):
+        from therapy_notes import config as module
+        monkeypatch.setattr(module, "ENV_PATH", tmp_path / "missing.env")
+        monkeypatch.setenv("SESSION_DURATION_MINUTES", "42")
+        shared = module.config
+        original = dict(shared.__dict__)
+        try:
+            assert module.reload_config() is shared
+            assert shared.session_duration_minutes == 42
+        finally:
+            shared.__dict__.update(original)

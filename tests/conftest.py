@@ -77,7 +77,7 @@ def mock_config(tmp_path: Path, monkeypatch):
         "AUDIO_LOOPBACK_DEVICE": "",
         "OLLAMA_MODEL": "llama3.1",
         "OLLAMA_BASE_URL": "http://localhost:11434",
-        "DELETE_AUDIO_AFTER_TRANSCRIPTION": "false",
+        "DELETE_AUDIO_AFTER_NOTES": "false",
         "DELETE_RAW_TRANSCRIPT": "false",
     }
     for k, v in defaults.items():
